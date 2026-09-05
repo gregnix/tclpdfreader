@@ -144,6 +144,41 @@ verstecktem `.` -- Photo-Rendering braucht kein sichtbares Fenster.
   Untergrenze -- `pagecountExact` pruefen).
 - `formfields` via qpdf ist best-effort; `pdfium` wird bevorzugt.
 
+## 0.2 -- Seitengeometrie, Text vorhanden, Verschluesselung
+
+### `pagesize $h $page`
+
+| Schluessel | Bedeutung |
+|---|---|
+| `width` `height` | **Punkt**, aus `/MediaBox` |
+| `widthmm` `heightmm` | **Millimeter**, dieselbe Groesse |
+| `rotate` | 0, 90, 180 oder 270 |
+| `mediabox` `cropbox` | die Rechtecke selbst, leer wenn unbekannt |
+| `source` | welches Backend geantwortet hat |
+
+**Warum beide Einheiten:** in der Datei stehen Punkte, `pdfium` meldet
+Millimeter. Keines wird stillschweigend umgerechnet -- wer einen Stempel
+mit `pdf4tcl` baut, braucht Punkte; wer ihn ausmisst, meist Millimeter.
+
+**Warum `rotate` dabeisteht:** ohne die Drehung steht ein Stempel quer,
+sobald eine Seite `/Rotate 90` traegt -- und das faellt erst auf dem
+Papier auf.
+
+`/MediaBox`, `/CropBox` und `/Rotate` duerfen im Seitenbaum vererbt sein
+(ISO 32000-1 7.7.3.4); qpdf loest das in seiner JSON-Ausgabe auf.
+
+### `hastext $h $page`
+
+1, wenn die Seite Text enthaelt. Beantwortet vorab, ob `search`
+ueberhaupt etwas finden kann -- auf einem Scan sucht man sonst und haelt
+das leere Ergebnis fuer einen Fehler. Braucht pdfium.
+
+### `encryption $h`
+
+`encrypted`, `method`, `printing`, `modify`, `extract`. Ueberlagern und
+Bearbeiten scheitern an einer verschluesselten Datei ohne Passwort --
+besser vorher fragen als hinterher eine qpdf-Meldung deuten.
+
 ### Weitere Auskuenfte in 0.2
 
 `pagesizes $h` -- alle Masse auf einmal. Wer stempelt, braucht sie fuer

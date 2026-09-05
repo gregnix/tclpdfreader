@@ -13,7 +13,12 @@ missing.
 |---|---|---|---|
 | `tupdf` | pure Tcl (`tclutils::tupdf`) | version, metadata, trailer, raw objects, ZUGFeRD | none; token-scan only (no compressed object/xref streams), page count is a lower bound |
 | `pdfium` | native (`pdfiumtcl`) | page text, search, bookmarks, form fields, exact page count | needs `libpdfium` |
-| `qpdf` | CLI (`qpdf`) | exact page count, full JSON structure, acroform fields | needs the `qpdf` binary |
+| `qpdf` | CLI (`qpdf`) | exact page count, full JSON structure, acroform fields, **layers** | needs the `qpdf` binary |
+
+`layers` needs qpdf and nothing else will do: pdfium honours optional
+content when rendering but has no interface to enumerate or switch it.
+On a page object it only reports THAT the object sits in a layer -- the
+parameters of the `OC` mark come back as type 0. Measured 2026-09-05.
 
 None is required. With **no** backend beyond the pure-Tcl core you still get
 version, metadata, structure and ZUGFeRD. Add `pdfium` for content (text/search/
