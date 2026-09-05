@@ -143,3 +143,70 @@ verstecktem `.` -- Photo-Rendering braucht kein sichtbares Fenster.
 - `tupdf` sieht keine komprimierten Objekt-/Xref-Streams (Zaehlungen ggf.
   Untergrenze -- `pagecountExact` pruefen).
 - `formfields` via qpdf ist best-effort; `pdfium` wird bevorzugt.
+
+### Weitere Auskuenfte in 0.2
+
+`pagesizes $h` -- alle Masse auf einmal. Wer stempelt, braucht sie fuer
+jede Seite; einzeln abgefragt bezahlt man den qpdf-Aufruf je Seite.
+
+`annotations $h $page` -- was schon auf der Seite liegt: Kommentare,
+Verweise, Formularfelder. **Wer stempelt, sollte wissen, was er
+ueberklebt** -- sonst merkt man es erst, wenn jemand das PDF oeffnet und
+der Verweis unter dem Stempel liegt. Braucht pdfium.
+
+`links $h $page` -- Verweise mit Ziel und Rechteck.
+
+`pagelabels $h` -- `/PageLabels` aus dem Katalog, als Liste von
+`{index stil praefix start}`. Das ist **nicht** die Seitennummer: ein
+Dokument kann roemisch beginnen, bei 1 neu anfangen oder einen Anhang mit
+A-1 zaehlen. Wer eine Seitenzahl aufstempelt, will meist die
+Beschriftung -- sonst steht auf Seite iv eine 4. Leere Liste heisst: die
+Beschriftung ist die Nummer.
+
+`attachments $h` -- die **Schluessel** eingebetteter Dateien. Zum
+Entfernen braucht man sie, und sonst nennt sie nur
+`qpdf --list-attachments` auf der Kommandozeile.
+
+### Was hier NICHT geht, und warum
+
+**Rechtecke zu Suchtreffern.** `search` liefert Zeichenindex und Laenge,
+keine Koordinaten -- fuer "dieses Wort durchstreichen" braeuchte man sie.
+pdfium hat sie (`FPDFText_GetRect`), aber `tclpdfium 0.6.1` reicht sie
+nicht durch. Das ist eine Erweiterung der C-Schicht, nicht dieses
+Pakets. Bis dahin muss die Stelle von Hand kommen.
+
+### `layers $h`
+
+Die Ebenen (Optional Content Groups) des Dokuments, je Ebene ein dict:
+
+| Schluessel | Bedeutung |
+|---|---|
+| `id` | das Objekt, `"4 0 R"` |
+| `name` | wie er im Betrachter steht |
+| `visible` | 1, wenn beim Oeffnen sichtbar |
+| `print` | 1 gedruckt, 0 nicht, **leer** wenn die Datei nichts sagt |
+
+**Warum hier und nicht in tclpdfium:** pdfium befolgt Ebenen beim
+Rendern, hat aber keine Schnittstelle, sie aufzuzaehlen oder zu
+schalten. An einem Objekt meldet es nur, DASS es in einer Ebene liegt
+(Markierung `OC`); die Parameter kommen als Typ 0 zurueck. Wer wissen
+will, WELCHE Ebenen es gibt, muss in die Datei sehen -- und das kann
+qpdf.
+
+`print` **leer** heisst: die Datei sagt nichts, der Betrachter
+entscheidet. Das ist etwas anderes als `1`, und wer es gleichsetzt,
+verspricht mehr, als in der Datei steht.
+
+```tcl
+foreach l [tclpdfreader::layers $h] {
+    puts "[dict get $l name]: sichtbar=[dict get $l visible]"
+}
+# Debug-Raster: sichtbar=0
+# Vordruck (nur Ansicht): sichtbar=1   (print=0)
+```
+
+### `charboxes $h $page ?-range {start count}?`
+### `pageobjects $h $page`
+
+Durchgereicht an pdfium (ab 0.6.2): ein Rechteck je Zeichen, und woraus
+die Seite gezeichnet ist. `search` nimmt ebenfalls `-rects 1` entgegen.

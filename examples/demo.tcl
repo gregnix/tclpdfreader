@@ -18,6 +18,9 @@ show backends     {tclpdfreader::backends $h}
 show version      {tclpdfreader::version $h}
 show pagecount    {format "%s (exact=%s)" [tclpdfreader::pagecount $h] [tclpdfreader::pagecountExact $h]}
 show metadata     {tclpdfreader::metadata $h}
+show encryption   {tclpdfreader::encryption $h}
+show pagesize1    {tclpdfreader::pagesize $h 1}
+show hastext1     {expr {[tclpdfreader::hastext $h 1] ? "ja" : "nein (Scan?)"}}
 show zugferd      {tclpdfreader::zugferd $h}
 show formfields   {tclpdfreader::formfields $h}
 show pagetext-1   {string range [tclpdfreader::pagetext $h 1] 0 60}

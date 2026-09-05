@@ -220,6 +220,349 @@ proc ::tclpdfreader::formfields {h {page ""}} {
     return -code error "tclpdfreader: formfields braucht \"pdfium\" oder \"qpdf\""
 }
 
+# ---- page geometry --------------------------------------------------------
+#
+# Wer einen Stempel oder ein Wasserzeichen ueber eine fremde Seite legen
+# will, braucht drei Dinge: das Blattmass, den Beschnitt und die Drehung.
+# Ohne die Drehung steht der Stempel quer, sobald eine Seite /Rotate 90
+# traegt -- und das faellt erst auf dem Papier auf.
+#
+# EINHEITEN, weil sie hier auseinandergehen: in der DATEI stehen Punkte
+# (1/72 Zoll), pdfium meldet MILLIMETER. Beides wird gemeldet, keines
+# stillschweigend umgerechnet -- wer den Stempel mit pdf4tcl baut,
+# braucht Punkte, wer ihn ausmisst, meist Millimeter.
+#
+#   width height        Punkt, aus /MediaBox
+#   widthmm heightmm    Millimeter, dieselbe Groesse
+#   rotate              0, 90, 180 oder 270
+#   mediabox cropbox    die Rechtecke selbst, leer wenn unbekannt
+#   source              welches Backend geantwortet hat
+proc ::tclpdfreader::pagesize {h page} {
+    variable have; variable S
+    _check $h
+    set idx [_pageIndex $h $page]
+    set res [dict create width "" height "" widthmm "" heightmm "" \
+            rotate 0 mediabox {} cropbox {} source ""]
+
+    # qpdf zuerst: es liest die Rechtecke, wie sie in der Datei stehen,
+    # samt /CropBox und geerbtem /MediaBox aus dem Seitenbaum.
+    if {$have(qpdf)} {
+        if {![catch {_pageBoxesFromQpdf [_file $h] $idx} boxen] && \
+                [dict get $boxen mediabox] ne ""} {
+            set res [dict merge $res $boxen]
+            dict set res source qpdf
+        }
+    }
+    # pdfium ergaenzt oder springt ein. Es liefert Millimeter und die
+    # Drehung, aber keine Rechtecke.
+    set pdoc [dict get $S($h) pdfium]
+    if {$pdoc ne ""} {
+        if {![catch {::pdfium::pagesize $pdoc $idx} mm]} {
+            lassign $mm wmm hmm
+            dict set res widthmm $wmm
+            dict set res heightmm $hmm
+            if {[dict get $res width] eq ""} {
+                dict set res width  [expr {$wmm * 72.0 / 25.4}]
+                dict set res height [expr {$hmm * 72.0 / 25.4}]
+                dict set res source pdfium
+            }
+        }
+        if {![catch {::pdfium::rotation $pdoc $idx} r]} { dict set res rotate $r }
+    }
+    if {[dict get $res width] eq ""} {
+        return -code error "tclpdfreader: pagesize braucht \"qpdf\" oder \"pdfium\""
+    }
+    if {[dict get $res widthmm] eq ""} {
+        dict set res widthmm  [expr {[dict get $res width]  * 25.4 / 72.0}]
+        dict set res heightmm [expr {[dict get $res height] * 25.4 / 72.0}]
+    }
+    return $res
+}
+
+# /MediaBox, /CropBox und /Rotate einer Seite aus qpdf --json.
+#
+# Alle drei duerfen im Seitenbaum VERERBT sein (ISO 32000-1 7.7.3.4) --
+# eine Seite ohne eigenes /MediaBox holt es vom Elternknoten. qpdf loest
+# das in seiner JSON-Ausgabe bereits auf, deshalb wird hier nichts
+# nachgeschlagen; wer den Baum selbst laeuft, muss es tun.
+proc ::tclpdfreader::_pageBoxesFromQpdf {file idx} {
+    set res [dict create mediabox {} cropbox {} width "" height "" rotate 0]
+    if {[catch {_qpdf $file --json --json-key=pages} j]} { return $res }
+    # Die Seiten stehen in der Reihenfolge des Dokuments; die idx-te ist
+    # unsere. Ohne rl_json reicht ein Durchgang durch die Objekte.
+    set seiten {}
+    foreach zeile [split $j \n] {
+        if {[regexp {"object":\s*"([0-9]+ [0-9]+ R)"} $zeile -> o]} {
+            lappend seiten $o
+        }
+    }
+    set obj [lindex $seiten $idx]
+    if {$obj eq ""} { return $res }
+    if {[catch {_qpdf $file --json --json-object=$obj} jo]} { return $res }
+    foreach {schluessel feld} {MediaBox mediabox CropBox cropbox} {
+        if {[regexp "\"/$schluessel\":\\s*\\\[(\[^\\\]\]*)\\\]" $jo -> werte]} {
+            set zahlen {}
+            foreach z [split [string map {, " "} $werte] " "] {
+                # trim VOR der Pruefung: "string is double" laesst
+                # umgebende Leerzeichen und Zeilenumbrueche durchgehen,
+                # und ein "842\n" landete dann als solches im Rechteck.
+                set z [string trim $z]
+                if {$z ne "" && [string is double -strict $z]} {
+                    lappend zahlen $z
+                }
+            }
+            if {[llength $zahlen] == 4} { dict set res $feld $zahlen }
+        }
+    }
+    if {[regexp {"/Rotate":\s*(-?[0-9]+)} $jo -> r]} {
+        dict set res rotate [expr {(($r % 360) + 360) % 360}]
+    }
+    set mb [dict get $res mediabox]
+    if {[llength $mb] == 4} {
+        lassign $mb x1 y1 x2 y2
+        dict set res width  [expr {abs($x2 - $x1)}]
+        dict set res height [expr {abs($y2 - $y1)}]
+    }
+    return $res
+}
+
+# Steht auf der Seite Text, oder ist es ein Scan?
+#
+# Beantwortet vorab, ob "search" ueberhaupt etwas finden kann. Ohne die
+# Auskunft sucht man auf einem gescannten Blatt und haelt das leere
+# Ergebnis fuer einen Fehler.
+proc ::tclpdfreader::hastext {h page} {
+    set pdoc [_pdfium $h hastext]
+    set t [::pdfium::gettext $pdoc [_pageIndex $h $page]]
+    expr {[string trim $t] ne ""}
+}
+
+# Ist die Datei geschuetzt, und was ist erlaubt?
+#
+# Ueberlagern und Bearbeiten scheitern an einer verschluesselten Datei
+# ohne Passwort -- besser vorher fragen als hinterher eine qpdf-Meldung
+# deuten.
+proc ::tclpdfreader::encryption {h} {
+    variable have; variable S
+    _check $h
+    set res [dict create encrypted 0 method "" printing 1 modify 1 extract 1]
+    if {!$have(qpdf)} {
+        # pdfium kann wenigstens sagen, ob gedruckt werden darf.
+        set pdoc [dict get $S($h) pdfium]
+        if {$pdoc ne "" && ![catch {::pdfium::canprint $pdoc} c]} {
+            dict set res printing $c
+        }
+        return $res
+    }
+    if {[catch {_qpdf [_file $h] --show-encryption} out]} { return $res }
+    if {[string match -nocase "*not encrypted*" $out]} { return $res }
+    dict set res encrypted 1
+    foreach {muster feld} {"*print: not allowed*" printing
+                           "*modify: not allowed*" modify
+                           "*extract: not allowed*" extract} {
+        if {[string match -nocase $muster $out]} { dict set res $feld 0 }
+    }
+    if {[regexp -nocase {R = ([0-9]+)} $out -> r]} { dict set res method "R$r" }
+    return $res
+}
+
+# Alle Seitenmasse auf einmal.
+#
+# Wer stempelt, braucht sie fuer jede Seite -- einzeln abgefragt bezahlt
+# man den qpdf-Aufruf je Seite. Hier einmal durchgehen und die Liste
+# zurueckgeben.
+proc ::tclpdfreader::pagesizes {h} {
+    _check $h
+    set alle {}
+    set n [pagecount $h]
+    for {set p 1} {$p <= $n} {incr p} { lappend alle [pagesize $h $p] }
+    return $alle
+}
+
+# Anmerkungen einer Seite -- was schon darauf liegt.
+#
+# Wer stempelt, sollte wissen, was er ueberklebt: ein Kommentar, ein
+# Verweis, ein Formularfeld. Ohne die Auskunft merkt man es erst, wenn
+# jemand das PDF oeffnet und der Verweis unter dem Stempel liegt.
+proc ::tclpdfreader::annotations {h page} {
+    set pdoc [_pdfium $h annotations]
+    return [::pdfium::annot_list $pdoc [_pageIndex $h $page]]
+}
+
+# Verweise einer Seite (Ziel und Rechteck).
+proc ::tclpdfreader::links {h page} {
+    set pdoc [_pdfium $h links]
+    return [::pdfium::links $pdoc [_pageIndex $h $page]]
+}
+
+# Seitenbeschriftungen: /PageLabels aus dem Katalog.
+#
+# Das ist NICHT die Seitennummer. Ein Dokument kann roemisch beginnen,
+# bei 1 neu anfangen oder einen Anhang mit A-1 zaehlen. Wer eine
+# Seitenzahl aufstempelt, will meist die BESCHRIFTUNG, nicht den Index --
+# sonst steht auf Seite iv eine 4.
+#
+# Rueckgabe: Liste von {index stil praefix start}, wie im Katalog. Leer,
+# wenn das Dokument keine hat -- dann ist die Beschriftung die Nummer.
+proc ::tclpdfreader::pagelabels {h} {
+    variable have
+    _check $h
+    if {!$have(qpdf)} { return {} }
+    if {[catch {_qpdf [_file $h] --json --json-key=pagelabels} j]} { return {} }
+    set res {}
+    # Ohne rl_json reicht ein Durchgang: die Eintraege sind flach.
+    set idx "" ; set stil "" ; set praefix "" ; set start ""
+    foreach zeile [split $j \n] {
+        if {[regexp {"index":\s*([0-9]+)} $zeile -> v]} {
+            if {$idx ne ""} { lappend res [list $idx $stil $praefix $start] }
+            set idx $v ; set stil "" ; set praefix "" ; set start ""
+        }
+        if {[regexp {"/S":\s*"/([A-Za-z]+)"} $zeile -> v]}  { set stil $v }
+        if {[regexp {"/P":\s*"u:([^"]*)"} $zeile -> v]}     { set praefix $v }
+        if {[regexp {"/St":\s*([0-9]+)} $zeile -> v]}       { set start $v }
+    }
+    if {$idx ne ""} { lappend res [list $idx $stil $praefix $start] }
+    return $res
+}
+
+# Eingebettete Dateien: Schluessel und Name.
+#
+# Gegenstueck zu tclpdfwriter::addAttachment und removeAttachments -- zum
+# Entfernen braucht man den SCHLUESSEL, und den nennt sonst nur
+# "qpdf --list-attachments" auf der Kommandozeile.
+proc ::tclpdfreader::attachments {h} {
+    variable have
+    _check $h
+    if {!$have(qpdf)} { return {} }
+    if {[catch {_qpdf [_file $h] --list-attachments} out]} { return {} }
+    set res {}
+    foreach zeile [split $out \n] {
+        # "schluessel -> 12,0" bzw. mit --verbose mehr; der Schluessel
+        # steht immer am Anfang.
+        set zeile [string trim $zeile]
+        if {$zeile eq "" || [string match "*attachments*" $zeile]} continue
+        if {[regexp {^(\S+)\s*->} $zeile -> k]} { lappend res $k }
+    }
+    return $res
+}
+
+# Ebenen (Optional Content Groups) des Dokuments.
+#
+# Rueckgabe je Ebene ein dict:
+#   id       das Objekt, "4 0 R"
+#   name     der Name, wie er im Betrachter steht
+#   visible  1 wenn beim Oeffnen sichtbar (aus /ON, /OFF und /BaseState)
+#   print    1 gedruckt, 0 nicht, "" wenn die Datei nichts dazu sagt
+#
+# WARUM HIER UND NICHT IN tclpdfium: pdfium befolgt Ebenen beim Rendern,
+# hat aber keine Schnittstelle, sie aufzuzaehlen oder zu schalten. Wer
+# wissen will, WELCHE Ebenen ein Dokument hat, muss in die Datei sehen --
+# und das kann qpdf. Nachgemessen am 05.09.2026: pdfium meldet an einem
+# Objekt nur, DASS es in einer Ebene liegt (Markierung "OC"), die
+# Parameter kommen als Typ 0 zurueck.
+#
+# "print" ist die Angabe aus /Usage /Print /PrintState. Leer heisst: die
+# Datei sagt nichts, der Betrachter entscheidet -- das ist etwas anderes
+# als "ja".
+proc ::tclpdfreader::layers {h} {
+    variable have
+    _check $h
+    if {!$have(qpdf)} { return {} }
+    if {[catch {_qpdf [_file $h] --json} j]} { return {} }
+
+    # ZEILENWEISE durchgehen, nicht mit einer Regex ueber die ganze
+    # Ausgabe.
+    #
+    # Der erste Versuch stand hier mit einem Muster fuer verschachtelte
+    # Klammern -- schon als Muster kaum zu lesen, und ein OCG mit /Usage
+    # hat zwei Ebenen, also haette es sie ohnehin nicht alle getroffen.
+    # qpdf schreibt die JSON-Ausgabe eingerueckt und mit einem Schluessel
+    # je Zeile; das reicht voellig.
+    set aus      {}
+    set druckbar {}
+    set hatAS    0
+
+    # qpdf schreibt Arrays ueber mehrere Zeilen, also merken, in welchem
+    # Abschnitt wir gerade sind.
+    set abschnitt ""
+    set event ""
+    foreach zeile [split $j \n] {
+        set t [string trim $zeile]
+        if {[string match {"/OFF":*} $t]}      { set abschnitt off ; continue }
+        if {[string match {"/ON":*} $t]}       { set abschnitt on  ; continue }
+        if {[string match {"/Event":*} $t]} {
+            regexp {"/Event":\s*"/([A-Za-z]+)"} $t -> event
+            continue
+        }
+        if {[string match {"/OCGs":*} $t]} {
+            set abschnitt [expr {$event eq "Print" ? "printas" : "andere"}]
+            if {$abschnitt eq "printas"} { set hatAS 1 }
+            continue
+        }
+        if {[string match "\]*" $t]} { set abschnitt "" ; continue }
+        if {$abschnitt eq "" } continue
+        if {![regexp {"([0-9]+ [0-9]+ R)"} $t -> ref]} continue
+        switch -- $abschnitt {
+            off     { lappend aus $ref }
+            printas { lappend druckbar $ref }
+        }
+    }
+
+    # Und die OCG-Objekte selbst: "obj:N 0 R" leitet einen Block ein,
+    # der bis zum naechsten "obj:" reicht.
+    set ergebnis {}
+    set id ""
+    set name ""
+    set imOCG 0
+    set printState ""
+    foreach zeile [split $j \n] {
+        set t [string trim $zeile]
+        if {[regexp {"obj:([0-9]+ [0-9]+ R)":} $t -> neueId]} {
+            # Den vorigen Block abschliessen.
+            if {$imOCG} {
+                lappend ergebnis [_layerDict $id $name $printState \
+                        $aus $druckbar $hatAS]
+            }
+            set id $neueId ; set name "" ; set imOCG 0 ; set printState ""
+            continue
+        }
+        if {[string match {*"/Type":*"/OCG"*} $t]} { set imOCG 1 ; continue }
+        if {[regexp {"/Name":\s*"u:(.*)"} $t -> n]} { set name $n ; continue }
+        if {[regexp {"/PrintState":\s*"/([A-Z]+)"} $t -> ps]} {
+            set printState [expr {$ps eq "ON"}]
+        }
+    }
+    if {$imOCG} {
+        lappend ergebnis [_layerDict $id $name $printState $aus $druckbar $hatAS]
+    }
+    return $ergebnis
+}
+
+proc ::tclpdfreader::_layerDict {id name printState aus druckbar hatAS} {
+    # "print" leer heisst: die Datei sagt nichts, der Betrachter
+    # entscheidet. Das ist etwas anderes als "ja" -- und wer es
+    # gleichsetzt, verspricht mehr, als in der Datei steht.
+    set drucken $printState
+    if {$drucken eq "" && $hatAS} {
+        set drucken [expr {[lsearch -exact $druckbar $id] >= 0}]
+    }
+    return [dict create id $id name $name \
+            visible [expr {[lsearch -exact $aus $id] < 0}] \
+            print $drucken]
+}
+
+# Rechtecke je Zeichen -- durchgereicht an pdfium (0.6.2).
+proc ::tclpdfreader::charboxes {h page args} {
+    set pdoc [_pdfium $h charboxes]
+    return [::pdfium::charboxes $pdoc [_pageIndex $h $page] {*}$args]
+}
+
+# Woraus die Seite gezeichnet ist -- durchgereicht an pdfium (0.6.2).
+proc ::tclpdfreader::pageobjects {h page} {
+    set pdoc [_pdfium $h pageobjects]
+    return [::pdfium::pageobjects $pdoc [_pageIndex $h $page]]
+}
+
 # ---- structure JSON (qpdf) ------------------------------------------------
 proc ::tclpdfreader::json {h args} {
     _check $h; _need qpdf json
@@ -242,6 +585,16 @@ proc ::tclpdfreader::capabilities {h} {
     dict set caps bookmarks [expr {"pdfium" in $b}]
     dict set caps formfields [expr {"pdfium" in $b || "qpdf" in $b}]
     dict set caps json      [expr {"qpdf" in $b}]
+    dict set caps pagesize  [expr {"qpdf" in $b || "pdfium" in $b}]
+    dict set caps hastext   [expr {"pdfium" in $b}]
+    dict set caps encryption [expr {"qpdf" in $b || "pdfium" in $b}]
+    dict set caps annotations [expr {"pdfium" in $b}]
+    dict set caps links       [expr {"pdfium" in $b}]
+    dict set caps pagelabels  [expr {"qpdf" in $b}]
+    dict set caps attachments [expr {"qpdf" in $b}]
+    dict set caps layers      [expr {"qpdf" in $b}]
+    dict set caps charboxes   [expr {"pdfium" in $b}]
+    dict set caps pageobjects [expr {"pdfium" in $b}]
     return $caps
 }
 
@@ -417,4 +770,4 @@ proc ::tclpdfreader::debug::report {h} {
     return [join $L \n]
 }
 
-package provide tclpdfreader 0.1
+package provide tclpdfreader 0.2
